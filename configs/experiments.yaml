@@ -1,6 +1,9 @@
 experiments:
   tracking_uri_env: MLFLOW_TRACKING_URI
   default_name: movielens-25m
+  evaluation:
+    relevance_rating_threshold: 4.0
+    k: 10
   ab:
     name: recommendation-ranking-v1
     control: popularity

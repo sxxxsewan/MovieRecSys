@@ -1,13 +1,16 @@
 PYTHON ?= python
 PIP ?= $(PYTHON) -m pip
 
-.PHONY: setup load-data train test up down
+.PHONY: setup migrate load-data train test up down
 
 setup:
 	$(PIP) install -e ".[dev]"
 	pre-commit install
 
-load-data:
+migrate:
+	alembic upgrade head
+
+load-data: migrate
 	$(PYTHON) -m recsys.data.loader --config configs/data.yaml
 
 train:
