@@ -1,0 +1,20 @@
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  files:
+    ratings: ratings.csv
+    movies: movies.csv
+    tags: tags.csv
+    links: links.csv
+    genome_scores: genome-scores.csv
+    genome_tags: genome-tags.csv
+  split:
+    train_fraction: 0.8
+    validation_fraction: 0.1
+    test_fraction: 0.1
+  filtering:
+    min_user_ratings: 5
+    min_movie_ratings: 5
+  database:
+    url_env: DATABASE_URL
+    chunk_size: 10000

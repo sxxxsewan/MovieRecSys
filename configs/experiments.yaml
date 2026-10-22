@@ -1,0 +1,12 @@
+experiments:
+  tracking_uri_env: MLFLOW_TRACKING_URI
+  default_name: movielens-25m
+  ab:
+    name: recommendation-ranking-v1
+    control: popularity
+    treatment: hybrid
+    minimum_detectable_effect: 0.02
+    alpha: 0.05
+    power: 0.8
+    rating_click_threshold: 4.0
+    bootstrap_samples: 10000

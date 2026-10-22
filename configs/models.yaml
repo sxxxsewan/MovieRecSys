@@ -1,0 +1,19 @@
+models:
+  popularity:
+    metric: rating_count
+    smoothing: 10.0
+  item_knn:
+    k_neighbors: 50
+    min_similarity: 0.0
+  als:
+    factors: 64
+    regularization: 0.1
+    iterations: 15
+    seed: 42
+  content_based:
+    max_features: 20000
+    svd_components: 128
+  hybrid:
+    als_weight: 0.7
+    content_weight: 0.3
+    tune_on: validation

@@ -1,0 +1,71 @@
+services:
+  postgres:
+    image: postgres:16.4
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-recsys}
+      POSTGRES_USER: ${POSTGRES_USER:-recsys}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-recsys-local}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-recsys} -d ${POSTGRES_DB:-recsys}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mlflow:
+    build: .
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --backend-store-uri
+      - ${MLFLOW_BACKEND_STORE_URI:-postgresql+psycopg://recsys:recsys-local@postgres:5432/recsys}
+      - --default-artifact-root
+      - /mlartifacts
+    ports:
+      - "${MLFLOW_PORT:-5000}:5000"
+    volumes:
+      - mlflow-artifacts:/mlartifacts
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    command: ["uvicorn", "recsys.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://recsys:recsys-local@postgres:5432/recsys}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    volumes:
+      - ./data:/app/data:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mlflow:
+        condition: service_started
+
+  ui:
+    build: .
+    command: ["streamlit", "run", "src/recsys/ui/app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+    environment:
+      API_BASE_URL: ${API_BASE_URL:-http://api:8000}
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+    ports:
+      - "${UI_PORT:-8501}:8501"
+    depends_on:
+      api:
+        condition: service_started
+      mlflow:
+        condition: service_started
+
+volumes:
+  postgres-data:
+  mlflow-artifacts:
