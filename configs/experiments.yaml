@@ -4,11 +4,13 @@ experiments:
   evaluation:
     relevance_rating_threshold: 4.0
     k: 10
+    batch_size: 256
   ab:
     name: recommendation-ranking-v1
     control: popularity
     treatment: hybrid
     minimum_detectable_effect: 0.02
+    baseline_click_rate: 0.1
     alpha: 0.05
     power: 0.8
     rating_click_threshold: 4.0

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
@@ -193,7 +194,11 @@ def _load_config(config_path: Path) -> tuple[Path, int, str, dict[str, str]]:
         config = yaml.safe_load(config_file)
     data_config = config["data"]
     database_config = data_config["database"]
-    data_dir = Path(data_config["raw_dir"])
+    raw_dir_env = str(data_config.get("raw_dir_env", "MOVIELENS_DATA_DIR"))
+    configured_path = os.getenv(raw_dir_env) or str(data_config["raw_dir"])
+    data_dir = Path(configured_path).expanduser()
+    if not data_dir.is_absolute():
+        data_dir = (config_path.resolve().parent / data_dir).resolve()
     return (
         data_dir,
         int(database_config["chunk_size"]),

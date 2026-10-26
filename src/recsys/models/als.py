@@ -3,14 +3,21 @@
 from __future__ import annotations
 
 from collections.abc import Hashable
+from concurrent.futures import ThreadPoolExecutor
 from numbers import Integral
 
 import numpy as np
 import pandas as pd
 from scipy import sparse
 from scipy.sparse.linalg import svds
+from threadpoolctl import threadpool_limits
 
-from recsys.models.base import rank_scores, validate_interactions, validate_k
+from recsys.models.base import (
+    rank_score_matrix,
+    rank_scores,
+    validate_interactions,
+    validate_k,
+)
 
 
 def _interaction_matrix(
@@ -30,11 +37,11 @@ def _interaction_matrix(
     item_index = {item_id: index for index, item_id in enumerate(item_ids)}
     rows = interactions["user_id"].map(user_index).to_numpy()
     columns = interactions["movie_id"].map(item_index).to_numpy()
-    ratings = interactions["rating"].astype(np.float64).to_numpy()
+    ratings = interactions["rating"].astype(np.float32).to_numpy()
     matrix = sparse.csr_matrix(
         (ratings, (rows, columns)),
         shape=(len(user_ids), len(item_ids)),
-        dtype=np.float64,
+        dtype=np.float32,
     )
     user_items = interactions.groupby("user_id")["movie_id"].agg(set).to_dict()
     return user_ids, item_ids, user_index, item_index, matrix, user_items
@@ -49,6 +56,7 @@ class ALSRecommender:
         regularization: float = 0.1,
         iterations: int = 15,
         seed: int = 42,
+        workers: int = 1,
     ) -> None:
         if (
             isinstance(factors, bool)
@@ -62,12 +70,19 @@ class ALSRecommender:
             or iterations < 1
         ):
             raise ValueError("iterations must be a positive integer")
+        if (
+            isinstance(workers, bool)
+            or not isinstance(workers, Integral)
+            or workers < 1
+        ):
+            raise ValueError("workers must be a positive integer")
         if not np.isfinite(regularization) or regularization <= 0:
             raise ValueError("regularization must be finite and positive")
         self.factors = int(factors)
         self.regularization = float(regularization)
         self.iterations = int(iterations)
         self.seed = int(seed)
+        self.workers = int(workers)
         self.user_ids: list[Hashable] = []
         self.item_ids: list[Hashable] = []
         self.user_index: dict[Hashable, int] = {}
@@ -94,29 +109,51 @@ class ALSRecommender:
         item_factors = rng.normal(0.0, scale, size=(len(self.item_ids), self.factors))
         identity = np.eye(self.factors, dtype=np.float64)
 
-        for _ in range(self.iterations):
-            for user_row in range(matrix.shape[0]):
-                start, end = matrix.indptr[user_row : user_row + 2]
-                indices = matrix.indices[start:end]
-                ratings = matrix.data[start:end]
-                factors = item_factors[indices]
-                lhs = factors.T @ factors + self.regularization * identity
-                rhs = factors.T @ ratings
-                user_factors[user_row] = np.linalg.solve(lhs, rhs)
-
-            for item_column in range(matrix_csc.shape[1]):
-                start, end = matrix_csc.indptr[item_column : item_column + 2]
-                indices = matrix_csc.indices[start:end]
-                ratings = matrix_csc.data[start:end]
-                factors = user_factors[indices]
-                lhs = factors.T @ factors + self.regularization * identity
-                rhs = factors.T @ ratings
-                item_factors[item_column] = np.linalg.solve(lhs, rhs)
+        user_ranges = self._work_ranges(matrix.shape[0])
+        item_ranges = self._work_ranges(matrix_csc.shape[1])
+        with threadpool_limits(limits=1):
+            with ThreadPoolExecutor(max_workers=self.workers) as executor:
+                for _ in range(self.iterations):
+                    list(
+                        executor.map(
+                            lambda bounds: _update_factor_rows(
+                                matrix,
+                                item_factors,
+                                user_factors,
+                                identity,
+                                self.regularization,
+                                bounds[0],
+                                bounds[1],
+                            ),
+                            user_ranges,
+                        )
+                    )
+                    list(
+                        executor.map(
+                            lambda bounds: _update_factor_rows(
+                                matrix_csc,
+                                user_factors,
+                                item_factors,
+                                identity,
+                                self.regularization,
+                                bounds[0],
+                                bounds[1],
+                            ),
+                            item_ranges,
+                        )
+                    )
 
         self.user_factors = user_factors
         self.item_factors = item_factors
         self.is_fitted = True
         return self
+
+    def _work_ranges(self, entity_count: int) -> list[tuple[int, int]]:
+        chunk_size = max(1, (entity_count + self.workers - 1) // self.workers)
+        return [
+            (start, min(start + chunk_size, entity_count))
+            for start in range(0, entity_count, chunk_size)
+        ]
 
     def scores_for_user(self, user_id: Hashable) -> dict[Hashable, float]:
         """Return estimated ratings for every item."""
@@ -130,6 +167,23 @@ class ALSRecommender:
             item_id: float(scores[index]) for index, item_id in enumerate(self.item_ids)
         }
 
+    def score_matrix_for_users(self, user_ids: list[Hashable]) -> np.ndarray:
+        """Return dense user-by-item scores for a bounded user batch."""
+        if not self.is_fitted or self.user_factors is None or self.item_factors is None:
+            raise RuntimeError("ALSRecommender must be fitted before use")
+        rows = np.zeros((len(user_ids), len(self.item_ids)), dtype=np.float32)
+        known_positions = [
+            position
+            for position, user_id in enumerate(user_ids)
+            if user_id in self.user_index
+        ]
+        if known_positions:
+            factor_rows = [
+                self.user_index[user_ids[position]] for position in known_positions
+            ]
+            rows[known_positions] = self.user_factors[factor_rows] @ self.item_factors.T
+        return rows
+
     def recommend(self, user_id: Hashable, k: int = 10) -> list[tuple[Hashable, float]]:
         """Return top-scoring unseen items."""
         if not self.is_fitted:
@@ -142,6 +196,44 @@ class ALSRecommender:
             k,
             excluded_items=self.user_items.get(user_id, set()),
         )
+
+    def recommend_many(
+        self, user_ids: list[Hashable], k: int = 10, batch_size: int = 256
+    ) -> dict[Hashable, list[tuple[Hashable, float]]]:
+        """Score and rank users in bounded dense matrix batches."""
+        if not self.is_fitted:
+            raise RuntimeError("ALSRecommender must be fitted before use")
+        validate_k(k)
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        recommendations: dict[Hashable, list[tuple[Hashable, float]]] = {}
+        for offset in range(0, len(user_ids), batch_size):
+            users = user_ids[offset : offset + batch_size]
+            scores = self.score_matrix_for_users(users)
+            exclusions = [self.user_items.get(user_id, set()) for user_id in users]
+            ranked = rank_score_matrix(scores, self.item_ids, k, exclusions)
+            recommendations.update(zip(users, ranked, strict=True))
+        return recommendations
+
+
+def _update_factor_rows(
+    matrix: sparse.csr_matrix | sparse.csc_matrix,
+    known_factors: np.ndarray,
+    updated_factors: np.ndarray,
+    identity: np.ndarray,
+    regularization: float,
+    start_row: int,
+    end_row: int,
+) -> None:
+    """Solve a disjoint range of regularized least-squares factor rows."""
+    for row_index in range(start_row, end_row):
+        start, end = matrix.indptr[row_index : row_index + 2]
+        indices = matrix.indices[start:end]
+        ratings = matrix.data[start:end]
+        factors = known_factors[indices]
+        lhs = factors.T @ factors + regularization * identity
+        rhs = factors.T @ ratings
+        updated_factors[row_index] = np.linalg.solve(lhs, rhs)
 
 
 class SVDSReferenceRecommender(ALSRecommender):

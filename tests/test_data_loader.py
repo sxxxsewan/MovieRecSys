@@ -4,9 +4,10 @@ from pathlib import Path
 
 import pandas as pd
 import pytest
+import yaml
 from sqlalchemy import create_engine, select
 
-from recsys.data.loader import load_data
+from recsys.data.loader import _load_config, load_data
 from recsys.db import GenomeScore, GenomeTag, Link, Movie, Tag, User
 
 
@@ -86,3 +87,33 @@ def test_load_data_requires_replace_for_existing_rows(
 
     with pytest.raises(RuntimeError, match="Use --replace"):
         load_data(movielens_csvs, engine)
+
+
+def test_load_config_resolves_project_data_path_and_environment_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    config_path = config_dir / "data.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "data": {
+                    "raw_dir": "../data",
+                    "raw_dir_env": "MOVIELENS_DATA_DIR",
+                    "files": {"ratings": "ratings.csv"},
+                    "database": {"chunk_size": 50000},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    monkeypatch.delenv("MOVIELENS_DATA_DIR", raising=False)
+    default_dir, *_ = _load_config(config_path)
+    override_dir = tmp_path / "drive" / "raw"
+    monkeypatch.setenv("MOVIELENS_DATA_DIR", str(override_dir))
+    configured_dir, *_ = _load_config(config_path)
+
+    assert default_dir == tmp_path / "data"
+    assert configured_dir == override_dir

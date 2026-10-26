@@ -45,6 +45,9 @@ services:
     environment:
       DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://recsys:recsys-local@postgres:5432/recsys_app}
       MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      RECSYS_CONTROL_MODEL_URI: ${RECSYS_CONTROL_MODEL_URI:-}
+      RECSYS_TREATMENT_MODEL_URI: ${RECSYS_TREATMENT_MODEL_URI:-}
+      RECSYS_SIMILAR_MODEL_URI: ${RECSYS_SIMILAR_MODEL_URI:-}
     ports:
       - "${API_PORT:-8000}:8000"
     volumes:
@@ -61,6 +64,8 @@ services:
     environment:
       API_BASE_URL: ${API_BASE_URL:-http://api:8000}
       MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      MLFLOW_EXPERIMENT_NAME: ${MLFLOW_EXPERIMENT_NAME:-movielens-25m}
+      RECSYS_EXPERIMENT_NAME: ${RECSYS_EXPERIMENT_NAME:-recommendation-ranking-v1}
     ports:
       - "${UI_PORT:-8501}:8501"
     depends_on:

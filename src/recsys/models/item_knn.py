@@ -8,10 +8,16 @@ from numbers import Integral
 import numpy as np
 import pandas as pd
 from scipy import sparse
+from sklearn import config_context
 from sklearn.neighbors import NearestNeighbors
 from sklearn.preprocessing import normalize
 
-from recsys.models.base import rank_scores, validate_interactions, validate_k
+from recsys.models.base import (
+    rank_score_matrix,
+    rank_scores,
+    validate_interactions,
+    validate_k,
+)
 
 
 class ItemKNNRecommender:
@@ -65,26 +71,35 @@ class ItemKNNRecommender:
             algorithm="brute",
             n_jobs=-1,
         ).fit(item_vectors)
-        distances, indices = neighbors.kneighbors(item_vectors)
         rows_out: list[int] = []
         columns_out: list[int] = []
         values_out: list[float] = []
-        for item_index, (item_distances, item_neighbors) in enumerate(
-            zip(distances, indices, strict=True)
-        ):
-            added = 0
-            for distance, neighbor_index in zip(
-                item_distances, item_neighbors, strict=True
-            ):
-                similarity = max(0.0, 1.0 - float(distance))
-                if neighbor_index == item_index or similarity < self.min_similarity:
-                    continue
-                rows_out.append(item_index)
-                columns_out.append(int(neighbor_index))
-                values_out.append(similarity)
-                added += 1
-                if added == self.k_neighbors:
-                    break
+        with config_context(working_memory=256):
+            for start in range(0, len(self.item_ids), 1024):
+                stop = min(start + 1024, len(self.item_ids))
+                distances, indices = neighbors.kneighbors(
+                    item_vectors[start:stop], return_distance=True
+                )
+                for local_index, (item_distances, item_neighbors) in enumerate(
+                    zip(distances, indices, strict=True)
+                ):
+                    item_index = start + local_index
+                    added = 0
+                    for distance, neighbor_index in zip(
+                        item_distances, item_neighbors, strict=True
+                    ):
+                        similarity = max(0.0, 1.0 - float(distance))
+                        if (
+                            neighbor_index == item_index
+                            or similarity < self.min_similarity
+                        ):
+                            continue
+                        rows_out.append(item_index)
+                        columns_out.append(int(neighbor_index))
+                        values_out.append(similarity)
+                        added += 1
+                        if added == self.k_neighbors:
+                            break
         self.similarity_matrix = sparse.csr_matrix(
             (values_out, (rows_out, columns_out)),
             shape=(len(self.item_ids), len(self.item_ids)),
@@ -138,3 +153,37 @@ class ItemKNNRecommender:
             k,
             excluded_items={movie_id},
         )
+
+    def recommend_many(
+        self, user_ids: list[Hashable], k: int = 10, batch_size: int = 256
+    ) -> dict[Hashable, list[tuple[Hashable, float]]]:
+        """Score and rank user batches using sparse matrix multiplication."""
+        if (
+            not self.is_fitted
+            or self.user_item_matrix is None
+            or self.similarity_matrix is None
+        ):
+            raise RuntimeError("ItemKNNRecommender must be fitted before use")
+        validate_k(k)
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        recommendations: dict[Hashable, list[tuple[Hashable, float]]] = {}
+        for offset in range(0, len(user_ids), batch_size):
+            users = user_ids[offset : offset + batch_size]
+            row_indices = [self.user_index.get(user_id) for user_id in users]
+            known_positions = [
+                position
+                for position, row_index in enumerate(row_indices)
+                if row_index is not None
+            ]
+            scores = np.zeros((len(users), len(self.item_ids)), dtype=np.float32)
+            if known_positions:
+                known_rows = [row_indices[position] for position in known_positions]
+                batch_scores = (
+                    self.user_item_matrix[known_rows] @ self.similarity_matrix
+                ).toarray()
+                scores[known_positions] = batch_scores
+            exclusions = [self.user_items.get(user_id, set()) for user_id in users]
+            ranked = rank_score_matrix(scores, self.item_ids, k, exclusions)
+            recommendations.update(zip(users, ranked, strict=True))
+        return recommendations

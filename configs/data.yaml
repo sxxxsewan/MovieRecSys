@@ -1,6 +1,7 @@
 data:
-  raw_dir: data/raw
-  processed_dir: data/processed
+  raw_dir: ../data
+  raw_dir_env: MOVIELENS_DATA_DIR
+  processed_dir: ../data/processed
   files:
     ratings: ratings.csv
     movies: movies.csv
@@ -17,4 +18,4 @@ data:
     min_movie_ratings: 5
   database:
     url_env: DATABASE_URL
-    chunk_size: 10000
+    chunk_size: 50000

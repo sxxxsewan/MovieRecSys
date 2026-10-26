@@ -11,9 +11,11 @@ from typing import Any
 import mlflow
 import pandas as pd
 import yaml
+from sqlalchemy import Engine, Table, select
 
 from recsys.data import split_and_filter_interactions
 from recsys.db import create_engine_from_url, get_database_url
+from recsys.db.models import GenomeScore, GenomeTag, Movie, Rating, Tag
 from recsys.evaluation import evaluate_recommendations
 from recsys.models.als import ALSRecommender, SVDSReferenceRecommender
 from recsys.models.content_based import ContentBasedRecommender
@@ -45,11 +47,18 @@ def _relevant_items(
 
 
 def _recommendations(
-    recommender: Any, users: Collection[Hashable], k: int
+    recommender: Any, users: Collection[Hashable], k: int, batch_size: int
 ) -> dict[Hashable, list[Hashable]]:
+    user_ids = list(users)
+    if hasattr(recommender, "recommend_many"):
+        ranked = recommender.recommend_many(user_ids, k, batch_size=batch_size)
+        return {
+            user_id: [item_id for item_id, _ in ranked.get(user_id, [])]
+            for user_id in user_ids
+        }
     return {
         user_id: [item_id for item_id, _ in recommender.recommend(user_id, k)]
-        for user_id in users
+        for user_id in user_ids
     }
 
 
@@ -60,13 +69,14 @@ def _evaluate_partition(
     catalog_size: int,
     relevance_rating_threshold: float,
     k: int,
+    batch_size: int,
 ) -> dict[str, float]:
     relevant = _relevant_items(interactions, relevance_rating_threshold)
     if not relevant:
         raise ValueError(
             "Evaluation partition has no ratings meeting the relevance threshold"
         )
-    ranked = _recommendations(recommender, relevant.keys(), k)
+    ranked = _recommendations(recommender, relevant.keys(), k, batch_size)
     return evaluate_recommendations(
         ranked,
         relevant,
@@ -80,22 +90,50 @@ def train_and_log(
     data_config_path: Path,
     model_config_path: Path,
     experiment_config_path: Path,
+    smoke: bool = False,
 ) -> str:
     """Run configured training, compare on validation, and register the best model."""
     data_config = _read_yaml(data_config_path)["data"]
     model_config = _read_yaml(model_config_path)["models"]
     experiment_config = _read_yaml(experiment_config_path)["experiments"]
-    database_config = data_config["database"]
-    engine = create_engine_from_url(
-        get_database_url(str(database_config.get("url_env", "DATABASE_URL")))
-    )
-
-    LOGGER.info("Loading persisted MovieLens tables for training")
-    ratings = pd.read_sql_table("ratings", engine)
-    movies = pd.read_sql_table("movies", engine)
-    tags = pd.read_sql_table("tags", engine)
-    genome_scores = pd.read_sql_table("genome_scores", engine)
-    genome_tags = pd.read_sql_table("genome_tags", engine)
+    if smoke:
+        LOGGER.info("Running bounded synthetic smoke workflow")
+        ratings, movies, tags, genome_scores, genome_tags = _make_smoke_data()
+        data_config = _smoke_data_config(data_config)
+        model_config = _smoke_model_config(model_config)
+    else:
+        database_config = data_config["database"]
+        engine = create_engine_from_url(
+            get_database_url(str(database_config.get("url_env", "DATABASE_URL")))
+        )
+        LOGGER.info("Loading persisted MovieLens tables for training")
+        try:
+            ratings = _read_sql_frame(
+                engine,
+                Rating.__table__,
+                {
+                    "user_id": "int32",
+                    "movie_id": "int32",
+                    "rating": "float32",
+                    "timestamp": "int32",
+                },
+            )
+            movies = _read_sql_frame(engine, Movie.__table__, {"movie_id": "int32"})
+            tags = _read_sql_frame(
+                engine,
+                Tag.__table__,
+                {"user_id": "int32", "movie_id": "int32", "timestamp": "int32"},
+            )
+            genome_scores = _read_sql_frame(
+                engine,
+                GenomeScore.__table__,
+                {"movie_id": "int32", "tag_id": "int32", "relevance": "float32"},
+            )
+            genome_tags = _read_sql_frame(
+                engine, GenomeTag.__table__, {"tag_id": "int32"}
+            )
+        finally:
+            engine.dispose()
     split = split_and_filter_interactions(
         ratings,
         train_fraction=float(data_config["split"]["train_fraction"]),
@@ -115,6 +153,9 @@ def train_and_log(
         evaluation_config.get("relevance_rating_threshold", 4.0)
     )
     evaluation_k = int(evaluation_config.get("k", 10))
+    evaluation_batch_size = int(evaluation_config.get("batch_size", 256))
+    if evaluation_batch_size < 1:
+        raise ValueError("evaluation.batch_size must be positive")
     validation_relevant = _relevant_items(split.validation, relevance_rating_threshold)
     if not validation_relevant:
         raise ValueError(
@@ -180,6 +221,7 @@ def train_and_log(
             catalog_size,
             relevance_rating_threshold,
             evaluation_k,
+            evaluation_batch_size,
         )
         test_metrics = _evaluate_partition(
             model,
@@ -188,6 +230,7 @@ def train_and_log(
             catalog_size,
             relevance_rating_threshold,
             evaluation_k,
+            evaluation_batch_size,
         )
         logged_metrics = {
             **{f"validation_{key}": value for key, value in validation_metrics.items()},
@@ -206,12 +249,10 @@ def train_and_log(
         )
         validation_scores[model_name] = validation_metrics[f"ndcg@{evaluation_k}"]
         LOGGER.info(
-            "%s validation NDCG@%d=%.6f test NDCG@%d=%.6f",
+            "%s validation_metrics=%s test_metrics=%s",
             model_name,
-            evaluation_k,
-            validation_scores[model_name],
-            evaluation_k,
-            test_metrics[f"ndcg@{evaluation_k}"],
+            validation_metrics,
+            test_metrics,
         )
 
     best_name = max(validation_scores, key=validation_scores.__getitem__)
@@ -247,6 +288,7 @@ def _fit_candidates_without_hybrid(
         regularization=float(als_config["regularization"]),
         iterations=int(als_config["iterations"]),
         seed=int(als_config["seed"]),
+        workers=int(als_config.get("workers", 1)),
     ).fit(train)
     svds_reference = SVDSReferenceRecommender(
         factors=int(als_config["factors"]),
@@ -278,6 +320,7 @@ def _fit_candidates_without_hybrid(
                 "regularization": als.regularization,
                 "iterations": als.iterations,
                 "seed": als.seed,
+                "workers": als.workers,
             },
         ),
         "svds_reference": (
@@ -295,12 +338,115 @@ def _fit_candidates_without_hybrid(
     }
 
 
+def _read_sql_frame(
+    engine: Engine, table: Table, dtypes: Mapping[str, str], chunksize: int = 500_000
+) -> pd.DataFrame:
+    """Read a SQL table in bounded chunks and downcast numeric columns."""
+    statement = select(*table.columns)
+    chunks = pd.read_sql_query(statement, engine, chunksize=chunksize)
+    frames = [
+        frame.astype({key: value for key, value in dtypes.items() if key in frame})
+        for frame in chunks
+    ]
+    if not frames:
+        return pd.DataFrame(columns=[column.name for column in table.columns]).astype(
+            {key: value for key, value in dtypes.items() if key in table.columns}
+        )
+    return pd.concat(frames, ignore_index=True, copy=False)
+
+
+def _make_smoke_data() -> (
+    tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
+):
+    """Create a small deterministic MovieLens-shaped dataset for the smoke path."""
+    user_count = 30
+    movie_count = 50
+    ratings_records: list[tuple[int, int, float, int]] = []
+    for round_index in range(20):
+        for user_id in range(1, user_count + 1):
+            movie_id = ((user_id * 7 + round_index * 11) % movie_count) + 1
+            rating = (
+                5.0
+                if (movie_id + user_id) % 4 == 0
+                else 3.0 + ((user_id * movie_id) % 3) * 0.5
+            )
+            ratings_records.append(
+                (user_id, movie_id, rating, round_index * user_count + user_id)
+            )
+    ratings = pd.DataFrame(
+        ratings_records,
+        columns=["user_id", "movie_id", "rating", "timestamp"],
+    )
+    movies = pd.DataFrame(
+        [
+            (
+                movie_id,
+                f"Synthetic Movie {movie_id}",
+                f"Genre{movie_id % 6}|Genre{(movie_id + 1) % 6}",
+            )
+            for movie_id in range(1, movie_count + 1)
+        ],
+        columns=["movie_id", "title", "genres"],
+    )
+    tags = pd.DataFrame(
+        [
+            (user_id, movie_id, f"tag{movie_id % 8}")
+            for user_id, movie_id, _, _ in ratings_records[::3]
+        ],
+        columns=["user_id", "movie_id", "tag"],
+    )
+    genome_scores = pd.DataFrame(
+        [
+            (movie_id, tag_id, float(((movie_id * tag_id) % 10) / 10))
+            for movie_id in range(1, movie_count + 1)
+            for tag_id in range(1, 7)
+        ],
+        columns=["movie_id", "tag_id", "relevance"],
+    )
+    genome_tags = pd.DataFrame(
+        [(tag_id, f"genome{tag_id}") for tag_id in range(1, 7)],
+        columns=["tag_id", "tag"],
+    )
+    return ratings, movies, tags, genome_scores, genome_tags
+
+
+def _smoke_data_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    smoke_config = dict(config)
+    smoke_config["split"] = {
+        "train_fraction": 0.8,
+        "validation_fraction": 0.1,
+        "test_fraction": 0.1,
+    }
+    smoke_config["filtering"] = {
+        "min_user_ratings": 1,
+        "min_movie_ratings": 1,
+    }
+    return smoke_config
+
+
+def _smoke_model_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    smoke_config = {
+        key: dict(value) if isinstance(value, Mapping) else value
+        for key, value in config.items()
+    }
+    smoke_config["item_knn"].update({"k_neighbors": 5})
+    smoke_config["als"].update({"factors": 4, "iterations": 2, "workers": 2})
+    smoke_config["content_based"].update({"max_features": 1000, "svd_components": 8})
+    smoke_config["hybrid"]["candidate_als_weights"] = [0.0, 0.5, 1.0]
+    return smoke_config
+
+
 def main() -> None:
     """Parse config paths and start the explicit training workflow."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-config", type=Path, required=True)
     parser.add_argument("--model-config", type=Path, required=True)
     parser.add_argument("--experiment-config", type=Path, required=True)
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="run the complete workflow on a small deterministic synthetic dataset",
+    )
     args = parser.parse_args()
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -309,6 +455,7 @@ def main() -> None:
         args.data_config,
         args.model_config,
         args.experiment_config,
+        smoke=args.smoke,
     )
 
 

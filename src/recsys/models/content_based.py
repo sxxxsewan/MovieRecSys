@@ -12,7 +12,7 @@ from sklearn.decomposition import TruncatedSVD
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import StandardScaler, normalize
 
-from recsys.models.base import rank_scores, validate_k
+from recsys.models.base import rank_score_matrix, rank_scores, validate_k
 
 
 class ContentBasedRecommender:
@@ -185,6 +185,21 @@ class ContentBasedRecommender:
             item_id: float(values[index]) for index, item_id in enumerate(self.item_ids)
         }
 
+    def score_matrix_for_users(self, user_ids: list[Hashable]) -> np.ndarray:
+        """Return dense content scores for a bounded list of user profiles."""
+        if not self.is_fitted or self.item_features is None:
+            raise RuntimeError("ContentBasedRecommender must be fitted before use")
+        profile_size = (
+            self.item_features.shape[1] if self.item_features.ndim == 2 else 0
+        )
+        profiles = np.zeros((len(user_ids), profile_size), dtype=np.float32)
+        for row, user_id in enumerate(user_ids):
+            profile = self.user_profiles.get(user_id)
+            if profile is not None:
+                profiles[row] = profile
+        scores = self.item_features @ profiles.T
+        return np.asarray(scores, dtype=np.float32).T
+
     def recommend(self, user_id: Hashable, k: int = 10) -> list[tuple[Hashable, float]]:
         """Return the top unseen content matches for a user."""
         if not self.is_fitted:
@@ -197,6 +212,24 @@ class ContentBasedRecommender:
             k,
             excluded_items=self.user_items.get(user_id, set()),
         )
+
+    def recommend_many(
+        self, user_ids: list[Hashable], k: int = 10, batch_size: int = 256
+    ) -> dict[Hashable, list[tuple[Hashable, float]]]:
+        """Score and rank users in bounded feature-matrix batches."""
+        if not self.is_fitted:
+            raise RuntimeError("ContentBasedRecommender must be fitted before use")
+        validate_k(k)
+        if batch_size < 1:
+            raise ValueError("batch_size must be positive")
+        recommendations: dict[Hashable, list[tuple[Hashable, float]]] = {}
+        for offset in range(0, len(user_ids), batch_size):
+            users = user_ids[offset : offset + batch_size]
+            scores = self.score_matrix_for_users(users)
+            exclusions = [self.user_items.get(user_id, set()) for user_id in users]
+            ranked = rank_score_matrix(scores, self.item_ids, k, exclusions)
+            recommendations.update(zip(users, ranked, strict=True))
+        return recommendations
 
     def recommend_from_favorites(
         self, favorite_movie_ids: list[Hashable], k: int = 10

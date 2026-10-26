@@ -9,7 +9,9 @@ from typing import Any
 
 import mlflow
 import pandas as pd
+from mlflow.models import ModelSignature
 from mlflow.pyfunc import PythonModel
+from mlflow.types import ColSpec, Schema
 
 
 class RecommendationPyfuncModel(PythonModel):
@@ -24,22 +26,37 @@ class RecommendationPyfuncModel(PythonModel):
         model_input: pd.DataFrame,
         params: dict[str, Any] | None = None,
     ) -> pd.DataFrame:
-        if "user_id" not in model_input.columns:
-            raise ValueError("Model input must include a user_id column")
-        recommendations: list[dict[str, Any]] = []
+        has_user_id = "user_id" in model_input.columns
+        has_movie_id = "movie_id" in model_input.columns
+        if has_user_id == has_movie_id:
+            raise ValueError(
+                "Model input must include exactly one of user_id or movie_id"
+            )
+        predictions: list[dict[str, Any]] = []
         for row in model_input.itertuples(index=False):
-            user_id = row.user_id
             if "k" in model_input.columns:
                 k = int(row.k)
             else:
                 k = int((params or {}).get("k", 10))
-            recommendations.append(
-                {
-                    "user_id": user_id,
-                    "recommendations": self.recommender.recommend(user_id, k),
-                }
-            )
-        return pd.DataFrame(recommendations)
+            if has_movie_id:
+                if not hasattr(self.recommender, "similar_items"):
+                    raise TypeError("This recommender does not support similar_items")
+                predictions.append(
+                    {
+                        "movie_id": row.movie_id,
+                        "similar_movies": self.recommender.similar_items(
+                            row.movie_id, k
+                        ),
+                    }
+                )
+            else:
+                predictions.append(
+                    {
+                        "user_id": row.user_id,
+                        "recommendations": self.recommender.recommend(row.user_id, k),
+                    }
+                )
+        return pd.DataFrame(predictions)
 
 
 def configure_tracking(tracking_uri_env: str = "MLFLOW_TRACKING_URI") -> None:
@@ -67,11 +84,20 @@ def log_recommender_run(
         mlflow.log_params(
             {key: _mlflow_parameter(value) for key, value in parameters.items()}
         )
-        mlflow.log_metrics({key: float(value) for key, value in metrics.items()})
+        mlflow.log_metrics(
+            {_mlflow_metric_name(key): float(value) for key, value in metrics.items()}
+        )
         mlflow.pyfunc.log_model(
             artifact_path="model",
             python_model=RecommendationPyfuncModel(recommender),
-            input_example=pd.DataFrame({"user_id": [0], "k": [10]}),
+            signature=ModelSignature(
+                inputs=Schema(
+                    [
+                        ColSpec("long", "user_id"),
+                        ColSpec("long", "k"),
+                    ]
+                )
+            ),
         )
         return run.info.run_id
 
@@ -87,3 +113,8 @@ def _mlflow_parameter(value: Any) -> str | int | float | bool:
     if isinstance(value, str | int | float | bool):
         return value
     return str(value)
+
+
+def _mlflow_metric_name(name: str) -> str:
+    """Encode ranking cutoffs with MLflow-safe characters."""
+    return name.replace("@", "_at_")

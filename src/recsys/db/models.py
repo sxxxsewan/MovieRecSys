@@ -1,12 +1,19 @@
 """SQLAlchemy models for MovieLens source data."""
 
+from datetime import datetime
+
 from sqlalchemy import (
     BigInteger,
+    Boolean,
+    DateTime,
     Float,
     ForeignKey,
     Index,
+    Integer,
     PrimaryKeyConstraint,
+    String,
     Text,
+    func,
 )
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -114,3 +121,50 @@ class GenomeScore(Base):
         nullable=False,
     )
     relevance: Mapped[float] = mapped_column(Float, nullable=False)
+
+
+class ExperimentResult(Base):
+    """Persisted outcome of one offline-simulated experiment."""
+
+    __tablename__ = "experiments"
+
+    experiment_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    experiment_name: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True
+    )
+    control_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    treatment_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    control_users: Mapped[int] = mapped_column(Integer, nullable=False)
+    treatment_users: Mapped[int] = mapped_column(Integer, nullable=False)
+    control_impressions: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    treatment_impressions: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    control_clicks: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    treatment_clicks: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    control_ctr: Mapped[float] = mapped_column(Float, nullable=False)
+    treatment_ctr: Mapped[float] = mapped_column(Float, nullable=False)
+    effect: Mapped[float] = mapped_column(Float, nullable=False)
+    p_value: Mapped[float] = mapped_column(Float, nullable=False)
+    confidence_interval_low: Mapped[float] = mapped_column(Float, nullable=False)
+    confidence_interval_high: Mapped[float] = mapped_column(Float, nullable=False)
+    sample_size_per_group: Mapped[int] = mapped_column(Integer, nullable=False)
+    statistical_test: Mapped[str] = mapped_column(String(64), nullable=False)
+    cuped_applied: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_simulated: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Feedback(Base):
+    """User-submitted rating or click feedback event."""
+
+    __tablename__ = "feedback"
+
+    feedback_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    movie_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    event_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    rating: Mapped[float | None] = mapped_column(Float)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )

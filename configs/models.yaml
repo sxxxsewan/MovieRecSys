@@ -6,10 +6,11 @@ models:
     k_neighbors: 50
     min_similarity: 0.0
   als:
-    factors: 64
+    factors: 32
     regularization: 0.1
-    iterations: 15
+    iterations: 8
     seed: 42
+    workers: 12
   content_based:
     max_features: 20000
     svd_components: 128

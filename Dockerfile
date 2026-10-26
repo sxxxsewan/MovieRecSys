@@ -12,6 +12,7 @@ RUN apt-get update \
 
 COPY pyproject.toml ./
 COPY src/ ./src/
+COPY configs/ ./configs/
 COPY alembic.ini ./
 COPY migrations/ ./migrations/
 
