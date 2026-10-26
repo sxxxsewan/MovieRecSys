@@ -43,6 +43,19 @@ FILE_COLUMNS: dict[str, tuple[str, ...]] = {
     "genome_scores": ("movieId", "tagId", "relevance"),
     "genome_tags": ("tagId", "tag"),
 }
+REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "ratings": ("userId", "movieId", "rating", "timestamp"),
+    "movies": ("movieId", "title", "genres"),
+    "tags": ("userId", "movieId", "tag", "timestamp"),
+    "links": ("movieId",),
+    "genome_scores": ("movieId", "tagId", "relevance"),
+    "genome_tags": ("tagId", "tag"),
+}
+REQUIRED_TEXT_COLUMNS: dict[str, tuple[str, ...]] = {
+    "movies": ("title", "genres"),
+    "tags": ("tag",),
+    "genome_tags": ("tag",),
+}
 COLUMN_NAMES = {
     "userId": "user_id",
     "movieId": "movie_id",
@@ -74,9 +87,21 @@ def _validate_headers(data_dir: Path, files: dict[str, str]) -> None:
 
 
 def _iter_csv_records(
-    path: Path, columns: Sequence[str], chunk_size: int
+    table_name: str, path: Path, columns: Sequence[str], chunk_size: int
 ) -> Iterator[list[dict[str, Any]]]:
+    dropped_rows = 0
     for frame in pd.read_csv(path, usecols=list(columns), chunksize=chunk_size):
+        valid_rows = pd.Series(True, index=frame.index)
+        for column in REQUIRED_COLUMNS[table_name]:
+            if column in REQUIRED_TEXT_COLUMNS.get(table_name, ()):
+                stripped = frame[column].astype("string").str.strip()
+                valid_rows &= (stripped.notna() & stripped.ne("")).fillna(False)
+                if table_name == "tags" and column == "tag":
+                    frame[column] = stripped
+            else:
+                valid_rows &= frame[column].notna()
+        dropped_rows += int((~valid_rows).sum())
+        frame = frame.loc[valid_rows]
         frame = frame.rename(columns=COLUMN_NAMES)
         records: list[dict[str, Any]] = []
         for record in frame.to_dict(orient="records"):
@@ -93,6 +118,12 @@ def _iter_csv_records(
             records.append(normalized)
         if records:
             yield records
+    LOGGER.info(
+        "Dropped %s rows with missing or blank required values from %s in %s",
+        dropped_rows,
+        table_name,
+        path,
+    )
 
 
 def _insert_csv(
@@ -103,7 +134,7 @@ def _insert_csv(
     chunk_size: int,
 ) -> int:
     inserted = 0
-    for records in _iter_csv_records(path, columns, chunk_size):
+    for records in _iter_csv_records(table.name, path, columns, chunk_size):
         connection.execute(insert(table), records)
         inserted += len(records)
     LOGGER.info("Loaded %s rows into %s from %s", inserted, table.name, path)

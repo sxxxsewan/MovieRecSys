@@ -89,6 +89,34 @@ def test_load_data_requires_replace_for_existing_rows(
         load_data(movielens_csvs, engine)
 
 
+def test_load_data_drops_null_and_blank_tags(
+    movielens_csvs: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    pd.DataFrame(
+        [
+            (1, 10, "  favorite  ", 300),
+            (1, 10, "   ", 301),
+            (2, 10, None, 302),
+        ],
+        columns=["userId", "movieId", "tag", "timestamp"],
+    ).to_csv(movielens_csvs / "tags.csv", index=False)
+    engine = create_engine(f"sqlite:///{tmp_path / 'test.db'}")
+    from recsys.db import Base
+
+    Base.metadata.create_all(engine)
+
+    counts = load_data(movielens_csvs, engine, chunk_size=1)
+
+    assert counts["tags"] == 1
+    with engine.connect() as connection:
+        tags = connection.scalars(select(Tag.tag)).all()
+    assert tags == ["favorite"]
+    assert (
+        "Dropped 2 rows with missing or blank required values from tags"
+        in caplog.text
+    )
+
+
 def test_load_config_resolves_project_data_path_and_environment_override(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
