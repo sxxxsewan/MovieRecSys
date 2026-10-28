@@ -247,6 +247,7 @@ def train_and_log(
             test_relevant,
             item_popularity,
             catalog_size,
+            relevance_rating_threshold,
             evaluation_k,
             evaluation_batch_size,
         )
@@ -270,6 +271,7 @@ def train_and_log(
         test_relevant,
         item_popularity,
         catalog_size,
+        relevance_rating_threshold,
         evaluation_k,
         evaluation_batch_size,
     )
@@ -298,6 +300,7 @@ def train_and_log(
         test_relevant,
         item_popularity,
         catalog_size,
+        relevance_rating_threshold,
         evaluation_k,
         evaluation_batch_size,
     )
@@ -315,6 +318,7 @@ def train_and_log(
             test_relevant,
             item_popularity,
             catalog_size,
+            relevance_rating_threshold,
             evaluation_k,
             evaluation_batch_size,
         )
@@ -351,6 +355,7 @@ def train_and_log(
             test_relevant,
             item_popularity,
             catalog_size,
+            relevance_rating_threshold,
             evaluation_k,
             evaluation_batch_size,
         )
@@ -377,6 +382,7 @@ def train_and_log(
         test_relevant,
         item_popularity,
         catalog_size,
+        relevance_rating_threshold,
         evaluation_k,
         evaluation_batch_size,
     )
