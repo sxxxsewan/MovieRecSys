@@ -119,12 +119,10 @@ class ContentBasedRecommender:
                 )
             tag_ids = sorted(genome["tag_id"].dropna().unique().tolist(), key=str)
             tag_index = {tag_id: index for index, tag_id in enumerate(tag_ids)}
-            genome_rows = genome["movie_id"].map(self.item_index).to_numpy(
-                dtype=np.int32
+            genome_rows = (
+                genome["movie_id"].map(self.item_index).to_numpy(dtype=np.int32)
             )
-            genome_columns = genome["tag_id"].map(tag_index).to_numpy(
-                dtype=np.int32
-            )
+            genome_columns = genome["tag_id"].map(tag_index).to_numpy(dtype=np.int32)
             genome_values = genome["relevance"].astype(np.float32).to_numpy()
             genome_matrix = sparse.csr_matrix(
                 (genome_values, (genome_rows, genome_columns)),
