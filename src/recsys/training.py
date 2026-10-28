@@ -416,9 +416,12 @@ def _read_sql_frame(
     return pd.concat(frames, ignore_index=True, copy=False)
 
 
-def _make_smoke_data() -> (
-    tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]
-):
+SmokeDataTuple = tuple[
+    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame
+]
+
+
+def _make_smoke_data() -> SmokeDataTuple:
     """Create a small deterministic MovieLens-shaped dataset for the smoke path."""
     user_count = 30
     movie_count = 50

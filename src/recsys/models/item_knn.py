@@ -57,9 +57,7 @@ class ItemKNNRecommender:
             item_id: index for index, item_id in enumerate(self.item_ids)
         }
         rows = interactions["user_id"].map(self.user_index).to_numpy(dtype=np.int32)
-        columns = interactions["movie_id"].map(self.item_index).to_numpy(
-            dtype=np.int32
-        )
+        columns = interactions["movie_id"].map(self.item_index).to_numpy(dtype=np.int32)
         values = interactions["rating"].astype(np.float32).to_numpy()
         matrix = sparse.csr_matrix(
             (values, (rows, columns)),
