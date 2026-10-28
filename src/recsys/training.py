@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 from collections.abc import Collection, Hashable, Mapping
 from pathlib import Path
@@ -64,14 +65,12 @@ def _recommendations(
 
 def _evaluate_partition(
     recommender: Any,
-    interactions: pd.DataFrame,
+    relevant: Mapping[Hashable, set[Hashable]],
     item_popularity: Mapping[Hashable, int],
     catalog_size: int,
-    relevance_rating_threshold: float,
     k: int,
     batch_size: int,
 ) -> dict[str, float]:
-    relevant = _relevant_items(interactions, relevance_rating_threshold)
     if not relevant:
         raise ValueError(
             "Evaluation partition has no ratings meeting the relevance threshold"
@@ -84,6 +83,59 @@ def _evaluate_partition(
         catalog_size=catalog_size,
         k=k,
     )
+
+
+def _evaluate_and_log_candidate(
+    model_name: str,
+    model: Any,
+    parameters: Mapping[str, Any],
+    validation_relevant: Mapping[Hashable, set[Hashable]],
+    test_relevant: Mapping[Hashable, set[Hashable]],
+    item_popularity: Mapping[Hashable, int],
+    catalog_size: int,
+    relevance_rating_threshold: float,
+    evaluation_k: int,
+    evaluation_batch_size: int,
+) -> tuple[str, float]:
+    validation_metrics = _evaluate_partition(
+        model,
+        validation_relevant,
+        item_popularity,
+        catalog_size,
+        evaluation_k,
+        evaluation_batch_size,
+    )
+    test_metrics = _evaluate_partition(
+        model,
+        test_relevant,
+        item_popularity,
+        catalog_size,
+        evaluation_k,
+        evaluation_batch_size,
+    )
+    logged_metrics = {
+        **{f"validation_{key}": value for key, value in validation_metrics.items()},
+        **{f"test_{key}": value for key, value in test_metrics.items()},
+    }
+    logged_parameters = {
+        **parameters,
+        "evaluation_k": evaluation_k,
+        "relevance_rating_threshold": relevance_rating_threshold,
+    }
+    run_id = log_recommender_run(
+        run_name=model_name,
+        recommender=model,
+        parameters=logged_parameters,
+        metrics=logged_metrics,
+    )
+    validation_score = validation_metrics[f"ndcg@{evaluation_k}"]
+    LOGGER.info(
+        "%s validation_metrics=%s test_metrics=%s",
+        model_name,
+        validation_metrics,
+        test_metrics,
+    )
+    return run_id, validation_score
 
 
 def train_and_log(
@@ -142,6 +194,8 @@ def train_and_log(
         min_user_ratings=int(data_config["filtering"]["min_user_ratings"]),
         min_movie_ratings=int(data_config["filtering"]["min_movie_ratings"]),
     )
+    del ratings
+    gc.collect()
     LOGGER.info(
         "Chronological split rows: train=%d validation=%d test=%d",
         len(split.train),
@@ -161,31 +215,147 @@ def train_and_log(
         raise ValueError(
             "Validation split has no ratings meeting the configured relevance threshold"
         )
+    test_relevant = _relevant_items(split.test, relevance_rating_threshold)
+    if not test_relevant:
+        raise ValueError(
+            "Test split has no ratings meeting the configured relevance threshold"
+        )
 
-    # Fit candidates in order: baseline first, then neighborhood, factor, and
-    # content methods. Hybrid tuning uses only the validation partition.
+    item_popularity = split.train["movie_id"].value_counts().astype(int).to_dict()
+    catalog_size = int(movies["movie_id"].nunique())
+    shared_user_items = split.train.groupby("user_id")["movie_id"].agg(set).to_dict()
+    tracking_env = str(experiment_config.get("tracking_uri_env", "MLFLOW_TRACKING_URI"))
+    configure_tracking(tracking_env)
+    experiment_name = str(experiment_config["default_name"])
+    mlflow.set_experiment(experiment_name)
+
+    run_ids: dict[str, str] = {}
+    validation_scores: dict[str, float] = {}
+
+    # Fit, evaluate, and release models as soon as possible to bound peak RAM.
     popularity_config = model_config["popularity"]
-    candidates: dict[str, tuple[Any, dict[str, Any]]] = {}
     popularity = PopularityRecommender(
         metric=popularity_config["metric"],
         smoothing=float(popularity_config["smoothing"]),
-    ).fit(split.train)
-    candidates["popularity"] = (
-        popularity,
-        {"metric": popularity.metric, "smoothing": popularity.smoothing},
+    ).fit(split.train, user_items=shared_user_items)
+    run_ids["popularity"], validation_scores["popularity"] = (
+        _evaluate_and_log_candidate(
+            "popularity",
+            popularity,
+            {"metric": popularity.metric, "smoothing": popularity.smoothing},
+            validation_relevant,
+            test_relevant,
+            item_popularity,
+            catalog_size,
+            evaluation_k,
+            evaluation_batch_size,
+        )
+    )
+    del popularity
+    gc.collect()
+
+    knn_config = model_config["item_knn"]
+    item_knn = ItemKNNRecommender(
+        k_neighbors=int(knn_config["k_neighbors"]),
+        min_similarity=float(knn_config["min_similarity"]),
+    ).fit(split.train, user_items=shared_user_items)
+    run_ids["item_knn"], validation_scores["item_knn"] = _evaluate_and_log_candidate(
+        "item_knn",
+        item_knn,
+        {
+            "k_neighbors": item_knn.k_neighbors,
+            "min_similarity": item_knn.min_similarity,
+        },
+        validation_relevant,
+        test_relevant,
+        item_popularity,
+        catalog_size,
+        evaluation_k,
+        evaluation_batch_size,
+    )
+    del item_knn
+    gc.collect()
+
+    als_config = model_config["als"]
+    als = ALSRecommender(
+        factors=int(als_config["factors"]),
+        regularization=float(als_config["regularization"]),
+        iterations=int(als_config["iterations"]),
+        seed=int(als_config["seed"]),
+        workers=int(als_config.get("workers", 1)),
+    ).fit(split.train, user_items=shared_user_items)
+    run_ids["als"], validation_scores["als"] = _evaluate_and_log_candidate(
+        "als",
+        als,
+        {
+            "factors": als.factors,
+            "regularization": als.regularization,
+            "iterations": als.iterations,
+            "seed": als.seed,
+            "workers": als.workers,
+        },
+        validation_relevant,
+        test_relevant,
+        item_popularity,
+        catalog_size,
+        evaluation_k,
+        evaluation_batch_size,
     )
 
-    remaining = _fit_candidates_without_hybrid(
-        split.train,
-        movies,
-        tags,
-        genome_scores,
-        genome_tags,
-        model_config,
+    svds_reference = SVDSReferenceRecommender(
+        factors=int(als_config["factors"]),
+        seed=int(als_config["seed"]),
+    ).fit(split.train, user_items=shared_user_items)
+    run_ids["svds_reference"], validation_scores["svds_reference"] = (
+        _evaluate_and_log_candidate(
+            "svds_reference",
+            svds_reference,
+            {"factors": svds_reference.factors, "seed": svds_reference.seed},
+            validation_relevant,
+            test_relevant,
+            item_popularity,
+            catalog_size,
+            evaluation_k,
+            evaluation_batch_size,
+        )
     )
-    candidates.update(remaining)
-    als = candidates["als"][0]
-    content = candidates["content_based"][0]
+    del svds_reference
+    gc.collect()
+
+    content_config = model_config["content_based"]
+    content = ContentBasedRecommender(
+        max_features=int(content_config["max_features"]),
+        svd_components=int(content_config["svd_components"]),
+        seed=int(als_config["seed"]),
+    ).fit(
+        movies=movies,
+        interactions=split.train,
+        tags=tags,
+        genome_scores=genome_scores,
+        genome_tags=genome_tags,
+        user_items=shared_user_items,
+    )
+    del tags, genome_scores, genome_tags
+    del movies
+    gc.collect()
+    run_ids["content_based"], validation_scores["content_based"] = (
+        _evaluate_and_log_candidate(
+            "content_based",
+            content,
+            {
+                "max_features": content.max_features,
+                "svd_components": content.svd_components,
+                "seed": content.seed,
+            },
+            validation_relevant,
+            test_relevant,
+            item_popularity,
+            catalog_size,
+            evaluation_k,
+            evaluation_batch_size,
+        )
+    )
+
     hybrid = HybridRecommender(als, content)
     hybrid_config = model_config["hybrid"]
     hybrid.tune(
@@ -195,65 +365,21 @@ def train_and_log(
         ),
         k=evaluation_k,
     )
-    candidates["hybrid"] = (
+    run_ids["hybrid"], validation_scores["hybrid"] = _evaluate_and_log_candidate(
+        "hybrid",
         hybrid,
         {
             "als_weight": hybrid.als_weight,
             "content_weight": 1.0 - hybrid.als_weight,
             "tuned_on": f"validation_map_at_{evaluation_k}",
         },
+        validation_relevant,
+        test_relevant,
+        item_popularity,
+        catalog_size,
+        evaluation_k,
+        evaluation_batch_size,
     )
-
-    item_popularity = split.train["movie_id"].value_counts().astype(int).to_dict()
-    catalog_size = int(movies["movie_id"].nunique())
-    tracking_env = str(experiment_config.get("tracking_uri_env", "MLFLOW_TRACKING_URI"))
-    configure_tracking(tracking_env)
-    experiment_name = str(experiment_config["default_name"])
-    mlflow.set_experiment(experiment_name)
-
-    run_ids: dict[str, str] = {}
-    validation_scores: dict[str, float] = {}
-    for model_name, (model, parameters) in candidates.items():
-        validation_metrics = _evaluate_partition(
-            model,
-            split.validation,
-            item_popularity,
-            catalog_size,
-            relevance_rating_threshold,
-            evaluation_k,
-            evaluation_batch_size,
-        )
-        test_metrics = _evaluate_partition(
-            model,
-            split.test,
-            item_popularity,
-            catalog_size,
-            relevance_rating_threshold,
-            evaluation_k,
-            evaluation_batch_size,
-        )
-        logged_metrics = {
-            **{f"validation_{key}": value for key, value in validation_metrics.items()},
-            **{f"test_{key}": value for key, value in test_metrics.items()},
-        }
-        logged_parameters = {
-            **parameters,
-            "evaluation_k": evaluation_k,
-            "relevance_rating_threshold": relevance_rating_threshold,
-        }
-        run_ids[model_name] = log_recommender_run(
-            run_name=model_name,
-            recommender=model,
-            parameters=logged_parameters,
-            metrics=logged_metrics,
-        )
-        validation_scores[model_name] = validation_metrics[f"ndcg@{evaluation_k}"]
-        LOGGER.info(
-            "%s validation_metrics=%s test_metrics=%s",
-            model_name,
-            validation_metrics,
-            test_metrics,
-        )
 
     best_name = max(validation_scores, key=validation_scores.__getitem__)
     registry_name = f"{experiment_name}-best"
@@ -267,79 +393,8 @@ def train_and_log(
     return best_name
 
 
-def _fit_candidates_without_hybrid(
-    train: pd.DataFrame,
-    movies: pd.DataFrame,
-    tags: pd.DataFrame,
-    genome_scores: pd.DataFrame,
-    genome_tags: pd.DataFrame,
-    model_config: Mapping[str, Any],
-) -> dict[str, tuple[Any, dict[str, Any]]]:
-    """Fit all non-baseline candidates after popularity has been logged first."""
-    knn_config = model_config["item_knn"]
-    als_config = model_config["als"]
-    content_config = model_config["content_based"]
-    item_knn = ItemKNNRecommender(
-        k_neighbors=int(knn_config["k_neighbors"]),
-        min_similarity=float(knn_config["min_similarity"]),
-    ).fit(train)
-    als = ALSRecommender(
-        factors=int(als_config["factors"]),
-        regularization=float(als_config["regularization"]),
-        iterations=int(als_config["iterations"]),
-        seed=int(als_config["seed"]),
-        workers=int(als_config.get("workers", 1)),
-    ).fit(train)
-    svds_reference = SVDSReferenceRecommender(
-        factors=int(als_config["factors"]),
-        seed=int(als_config["seed"]),
-    ).fit(train)
-    content = ContentBasedRecommender(
-        max_features=int(content_config["max_features"]),
-        svd_components=int(content_config["svd_components"]),
-        seed=int(als_config["seed"]),
-    ).fit(
-        movies=movies,
-        interactions=train,
-        tags=tags,
-        genome_scores=genome_scores,
-        genome_tags=genome_tags,
-    )
-    return {
-        "item_knn": (
-            item_knn,
-            {
-                "k_neighbors": item_knn.k_neighbors,
-                "min_similarity": item_knn.min_similarity,
-            },
-        ),
-        "als": (
-            als,
-            {
-                "factors": als.factors,
-                "regularization": als.regularization,
-                "iterations": als.iterations,
-                "seed": als.seed,
-                "workers": als.workers,
-            },
-        ),
-        "svds_reference": (
-            svds_reference,
-            {"factors": svds_reference.factors, "seed": svds_reference.seed},
-        ),
-        "content_based": (
-            content,
-            {
-                "max_features": content.max_features,
-                "svd_components": content.svd_components,
-                "seed": content.seed,
-            },
-        ),
-    }
-
-
 def _read_sql_frame(
-    engine: Engine, table: Table, dtypes: Mapping[str, str], chunksize: int = 500_000
+    engine: Engine, table: Table, dtypes: Mapping[str, str], chunksize: int = 100_000
 ) -> pd.DataFrame:
     """Read a SQL table in bounded chunks and downcast numeric columns."""
     statement = select(*table.columns)

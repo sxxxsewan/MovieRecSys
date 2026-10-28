@@ -30,14 +30,22 @@ class PopularityRecommender:
         self.item_popularity: dict[Hashable, int] = {}
         self.is_fitted = False
 
-    def fit(self, interactions: pd.DataFrame) -> PopularityRecommender:
+    def fit(
+        self,
+        interactions: pd.DataFrame,
+        user_items: dict[Hashable, set[Hashable]] | None = None,
+    ) -> PopularityRecommender:
         """Fit item counts and user history using the supplied training rows."""
         validate_interactions(interactions)
         grouped = interactions.groupby("movie_id", sort=True)
         counts = grouped.size()
         self.item_ids = counts.index.tolist()
         self.item_popularity = counts.astype(int).to_dict()
-        self.user_items = interactions.groupby("user_id")["movie_id"].agg(set).to_dict()
+        self.user_items = (
+            user_items
+            if user_items is not None
+            else interactions.groupby("user_id")["movie_id"].agg(set).to_dict()
+        )
 
         if self.metric == "rating_count":
             self.scores = counts.astype(float).tolist()

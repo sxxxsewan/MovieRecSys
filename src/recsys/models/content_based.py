@@ -56,6 +56,7 @@ class ContentBasedRecommender:
         tags: pd.DataFrame | None = None,
         genome_scores: pd.DataFrame | None = None,
         genome_tags: pd.DataFrame | None = None,
+        user_items: dict[Hashable, set[Hashable]] | None = None,
     ) -> ContentBasedRecommender:
         """Build item vectors, optional SVD features, and rating-weighted profiles."""
         movie_columns = {"movie_id", "genres"}
@@ -118,8 +119,12 @@ class ContentBasedRecommender:
                 )
             tag_ids = sorted(genome["tag_id"].dropna().unique().tolist(), key=str)
             tag_index = {tag_id: index for index, tag_id in enumerate(tag_ids)}
-            genome_rows = genome["movie_id"].map(self.item_index).to_numpy()
-            genome_columns = genome["tag_id"].map(tag_index).to_numpy()
+            genome_rows = genome["movie_id"].map(self.item_index).to_numpy(
+                dtype=np.int32
+            )
+            genome_columns = genome["tag_id"].map(tag_index).to_numpy(
+                dtype=np.int32
+            )
             genome_values = genome["relevance"].astype(np.float32).to_numpy()
             genome_matrix = sparse.csr_matrix(
                 (genome_values, (genome_rows, genome_columns)),
@@ -153,7 +158,11 @@ class ContentBasedRecommender:
         else:
             self.item_features = normalize(features, norm="l2", axis=1).tocsr()
 
-        self.user_items = interactions.groupby("user_id")["movie_id"].agg(set).to_dict()
+        self.user_items = (
+            user_items
+            if user_items is not None
+            else interactions.groupby("user_id")["movie_id"].agg(set).to_dict()
+        )
         self.user_profiles.clear()
         for user_id, history in interactions.groupby("user_id"):
             indices = history["movie_id"].map(self.item_index)
@@ -161,10 +170,10 @@ class ContentBasedRecommender:
             if not known.any():
                 continue
             item_rows = indices.loc[known].astype(int).to_numpy()
-            rating_values = history.loc[known, "rating"].astype(float).to_numpy()
+            rating_values = history.loc[known, "rating"].to_numpy(dtype=np.float32)
             weights = np.maximum(rating_values - 2.5, 0.1)
             profile = self.item_features[item_rows].T @ weights / weights.sum()
-            profile = np.asarray(profile).ravel()
+            profile = np.asarray(profile, dtype=np.float32).ravel()
             norm = np.linalg.norm(profile)
             if norm:
                 profile = profile / norm

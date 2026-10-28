@@ -41,7 +41,11 @@ class ItemKNNRecommender:
         self.similarity_matrix: sparse.csr_matrix | None = None
         self.is_fitted = False
 
-    def fit(self, interactions: pd.DataFrame) -> ItemKNNRecommender:
+    def fit(
+        self,
+        interactions: pd.DataFrame,
+        user_items: dict[Hashable, set[Hashable]] | None = None,
+    ) -> ItemKNNRecommender:
         """Build a sparse rating matrix and its truncated cosine graph."""
         validate_interactions(interactions)
         self.user_ids = sorted(interactions["user_id"].unique().tolist(), key=str)
@@ -52,8 +56,10 @@ class ItemKNNRecommender:
         self.item_index = {
             item_id: index for index, item_id in enumerate(self.item_ids)
         }
-        rows = interactions["user_id"].map(self.user_index).to_numpy()
-        columns = interactions["movie_id"].map(self.item_index).to_numpy()
+        rows = interactions["user_id"].map(self.user_index).to_numpy(dtype=np.int32)
+        columns = interactions["movie_id"].map(self.item_index).to_numpy(
+            dtype=np.int32
+        )
         values = interactions["rating"].astype(np.float32).to_numpy()
         matrix = sparse.csr_matrix(
             (values, (rows, columns)),
@@ -61,7 +67,11 @@ class ItemKNNRecommender:
             dtype=np.float32,
         )
         self.user_item_matrix = matrix
-        self.user_items = interactions.groupby("user_id")["movie_id"].agg(set).to_dict()
+        self.user_items = (
+            user_items
+            if user_items is not None
+            else interactions.groupby("user_id")["movie_id"].agg(set).to_dict()
+        )
 
         item_vectors = normalize(matrix.T.tocsr(), norm="l2", axis=1)
         neighbor_count = min(self.k_neighbors + 1, len(self.item_ids))
@@ -69,14 +79,14 @@ class ItemKNNRecommender:
             n_neighbors=neighbor_count,
             metric="cosine",
             algorithm="brute",
-            n_jobs=-1,
+            n_jobs=1,
         ).fit(item_vectors)
         rows_out: list[int] = []
         columns_out: list[int] = []
         values_out: list[float] = []
-        with config_context(working_memory=256):
-            for start in range(0, len(self.item_ids), 1024):
-                stop = min(start + 1024, len(self.item_ids))
+        with config_context(working_memory=64):
+            for start in range(0, len(self.item_ids), 128):
+                stop = min(start + 128, len(self.item_ids))
                 distances, indices = neighbors.kneighbors(
                     item_vectors[start:stop], return_distance=True
                 )

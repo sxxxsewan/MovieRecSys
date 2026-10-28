@@ -22,6 +22,7 @@ from recsys.models.base import (
 
 def _interaction_matrix(
     interactions: pd.DataFrame,
+    user_items: dict[Hashable, set[Hashable]] | None = None,
 ) -> tuple[
     list[Hashable],
     list[Hashable],
@@ -35,16 +36,20 @@ def _interaction_matrix(
     item_ids = sorted(interactions["movie_id"].unique().tolist(), key=str)
     user_index = {user_id: index for index, user_id in enumerate(user_ids)}
     item_index = {item_id: index for index, item_id in enumerate(item_ids)}
-    rows = interactions["user_id"].map(user_index).to_numpy()
-    columns = interactions["movie_id"].map(item_index).to_numpy()
+    rows = interactions["user_id"].map(user_index).to_numpy(dtype=np.int32)
+    columns = interactions["movie_id"].map(item_index).to_numpy(dtype=np.int32)
     ratings = interactions["rating"].astype(np.float32).to_numpy()
     matrix = sparse.csr_matrix(
         (ratings, (rows, columns)),
         shape=(len(user_ids), len(item_ids)),
         dtype=np.float32,
     )
-    user_items = interactions.groupby("user_id")["movie_id"].agg(set).to_dict()
-    return user_ids, item_ids, user_index, item_index, matrix, user_items
+    fitted_user_items = (
+        user_items
+        if user_items is not None
+        else interactions.groupby("user_id")["movie_id"].agg(set).to_dict()
+    )
+    return user_ids, item_ids, user_index, item_index, matrix, fitted_user_items
 
 
 class ALSRecommender:
@@ -92,7 +97,11 @@ class ALSRecommender:
         self.user_items: dict[Hashable, set[Hashable]] = {}
         self.is_fitted = False
 
-    def fit(self, interactions: pd.DataFrame) -> ALSRecommender:
+    def fit(
+        self,
+        interactions: pd.DataFrame,
+        user_items: dict[Hashable, set[Hashable]] | None = None,
+    ) -> ALSRecommender:
         """Optimize user and item factors with alternating least squares."""
         (
             self.user_ids,
@@ -101,7 +110,7 @@ class ALSRecommender:
             self.item_index,
             matrix,
             self.user_items,
-        ) = _interaction_matrix(interactions)
+        ) = _interaction_matrix(interactions, user_items=user_items)
         matrix_csc = matrix.tocsc()
         rng = np.random.default_rng(self.seed)
         scale = 1.0 / np.sqrt(self.factors)
@@ -239,7 +248,11 @@ def _update_factor_rows(
 class SVDSReferenceRecommender(ALSRecommender):
     """Low-rank truncated-SVD reference for ALS comparison."""
 
-    def fit(self, interactions: pd.DataFrame) -> SVDSReferenceRecommender:
+    def fit(
+        self,
+        interactions: pd.DataFrame,
+        user_items: dict[Hashable, set[Hashable]] | None = None,
+    ) -> SVDSReferenceRecommender:
         """Fit a rank-limited scipy.sparse.linalg.svds factorization."""
         (
             self.user_ids,
@@ -248,7 +261,7 @@ class SVDSReferenceRecommender(ALSRecommender):
             self.item_index,
             matrix,
             self.user_items,
-        ) = _interaction_matrix(interactions)
+        ) = _interaction_matrix(interactions, user_items=user_items)
         rank = min(self.factors, min(matrix.shape) - 1)
         if rank < 1:
             raise ValueError("svds reference needs at least two users and two items")
