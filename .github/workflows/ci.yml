@@ -18,3 +18,5 @@ jobs:
       - run: ruff check .
       - run: ruff format --check .
       - run: black --check .
+      - name: Build Docker image
+        run: docker build --tag movielens-recsys:ci .

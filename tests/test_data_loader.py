@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -92,6 +93,7 @@ def test_load_data_requires_replace_for_existing_rows(
 def test_load_data_drops_null_and_blank_tags(
     movielens_csvs: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
+    caplog.set_level(logging.INFO)
     pd.DataFrame(
         [
             (1, 10, "  favorite  ", 300),
@@ -112,8 +114,7 @@ def test_load_data_drops_null_and_blank_tags(
         tags = connection.scalars(select(Tag.tag)).all()
     assert tags == ["favorite"]
     assert (
-        "Dropped 2 rows with missing or blank required values from tags"
-        in caplog.text
+        "Dropped 2 rows with missing or blank required values from tags" in caplog.text
     )
 
 
